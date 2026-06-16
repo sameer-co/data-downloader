@@ -54,7 +54,7 @@ TELEGRAM_BOT_TOKEN = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
 TELEGRAM_CHAT_ID   = "1950462171"
 
 SYMBOL      = "BTCUSDT"                       # Binance trading pair
-TIMEFRAMES  = ["1m", "3m", "5m", "15m", "1h"] # order to download
+TIMEFRAMES  = ["5m", "15m", "1h"] # order to download
 OUTPUT_DIR  = Path("binance_data")            # folder for CSV files
 YEARS_BACK  = 6                               # how many years of history
 
