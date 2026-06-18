@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Binance Historical Data Downloader with Telegram Notifications
-- Downloads 6 years of OHLCV data for timeframes: 1m, 3m, 5m, 15m, 1h
-- Respects Binance rate limits
-- Sends each completed CSV file to Telegram
+- Downloads 6 years of OHLCV data for timeframes: 1h, 15m, 5m, 3m (largest first)
+- Streams each chunk directly to disk — no OOM from accumulating DataFrames
+- Respects Binance rate limits with auto back-off on 429/418
+- Sends each completed CSV file to Telegram after download
 - Self-installs all dependencies
 """
 
@@ -14,22 +15,54 @@ import os
 # ─────────────────────────────────────────────
 # SELF-INSTALL DEPENDENCIES
 # ─────────────────────────────────────────────
-REQUIRED = ["requests", "pandas", "python-telegram-bot"]
+# map pip package name -> actual importable module name
+REQUIRED = {
+    "requests": "requests",
+    "pandas": "pandas",
+    "python-telegram-bot": "telegram",
+}
+
+def _pip_install(pkg: str) -> bool:
+    """Try a normal pip install; return True on success."""
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 def install_dependencies():
     print("📦 Checking and installing dependencies...")
-    for pkg in REQUIRED:
+    for pip_name, import_name in REQUIRED.items():
         try:
-            __import__(pkg.replace("-", "_").split("[")[0])
-            print(f"  ✅ {pkg} already installed")
+            __import__(import_name)
+            print(f"  ✅ {pip_name} already installed")
+            continue
         except ImportError:
-            print(f"  ⬇️  Installing {pkg}...")
+            pass
+
+        print(f"  ⬇️  Installing {pip_name}...")
+        if _pip_install(pip_name):
+            print(f"  ✅ {pip_name} installed")
+            continue
+
+        # Some systems (PEP 668 / externally-managed) need this flag
+        print(f"  ↻ Retrying {pip_name} with --break-system-packages ...")
+        try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
+                [sys.executable, "-m", "pip", "install", pip_name,
+                 "--break-system-packages", "--quiet"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            print(f"  ✅ {pkg} installed")
+            print(f"  ✅ {pip_name} installed")
+        except subprocess.CalledProcessError:
+            print(f"  ❌ Failed to install {pip_name}. "
+                  f"Try manually: pip install {pip_name} --break-system-packages")
+            sys.exit(1)
 
 install_dependencies()
 
@@ -53,17 +86,17 @@ import telegram
 TELEGRAM_BOT_TOKEN = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
 TELEGRAM_CHAT_ID   = "1950462171"
 
-SYMBOL      = "BTCUSDT"                       # Binance trading pair
-TIMEFRAMES  = ["5m", "15m", "1h"] # order to download
-OUTPUT_DIR  = Path("binance_data")            # folder for CSV files
-YEARS_BACK  = 6                               # how many years of history
+SYMBOL      = "BTCUSDT"                        # Binance trading pair
+TIMEFRAMES  = ["1h", "15m", "5m", "3m"]        # 1m removed; largest tf first (low memory)
+OUTPUT_DIR  = Path("binance_data")             # folder for CSV files
+YEARS_BACK  = 6                                # how many years of history
 
 # Binance REST limits
 # Spot: 1200 weight/min; each klines call = 2 weight
 # Safe: ~500 calls/min → sleep ~0.12s between calls
 # We use 0.2s to be conservative
-REQUEST_DELAY_S     = 0.2   # seconds between API calls
-MAX_BARS_PER_CALL   = 1000  # Binance max klines limit
+REQUEST_DELAY_S   = 0.2    # seconds between API calls
+MAX_BARS_PER_CALL = 1000   # Binance max klines limit
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -76,7 +109,6 @@ log = logging.getLogger(__name__)
 BINANCE_BASE = "https://api.binance.com"
 
 TF_MS = {
-    "1m":  60_000,
     "3m":  180_000,
     "5m":  300_000,
     "15m": 900_000,
@@ -98,8 +130,7 @@ def get_server_time() -> int:
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list:
     """
     Fetch up to MAX_BARS_PER_CALL klines from Binance.
-    Returns list of raw kline rows.
-    Handles 429/418 rate-limit responses with back-off.
+    Handles 429/418 rate-limit responses with exponential back-off.
     """
     params = {
         "symbol":    symbol,
@@ -155,8 +186,8 @@ def klines_to_df(raw: list) -> pd.DataFrame:
 def download_timeframe(symbol: str, interval: str, years: int) -> Path:
     """
     Download `years` of klines for the given interval.
-    Saves to OUTPUT_DIR/<symbol>_<interval>_6y.csv
-    Returns path to the CSV.
+    ✅ Streams each chunk directly to CSV — no full dataset held in RAM.
+    Saves to OUTPUT_DIR/<symbol>_<interval>_6y.csv and returns the path.
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / f"{symbol}_{interval}_{years}y.csv"
@@ -165,39 +196,52 @@ def download_timeframe(symbol: str, interval: str, years: int) -> Path:
     tf_ms    = TF_MS[interval]
     start_ms = now_ms - years * 365 * 24 * 3600 * 1000
 
-    total_bars = (now_ms - start_ms) // tf_ms
+    total_bars   = (now_ms - start_ms) // tf_ms
     calls_needed = math.ceil(total_bars / MAX_BARS_PER_CALL)
 
     log.info(
-        f"📥 [{interval}] Downloading ~{total_bars:,} bars "
-        f"({calls_needed} API calls) …"
+        f"📥 [{interval}] ~{total_bars:,} bars over {calls_needed} API calls "
+        f"— streaming to disk (low-memory mode) …"
     )
 
-    all_frames = []
-    current_ms = start_ms
-    fetched    = 0
+    current_ms  = start_ms
+    fetched     = 0
+    first_chunk = True
+    seen_times  = set()   # lightweight dedup: only store timestamps
 
-    while current_ms < now_ms:
-        chunk_end = min(current_ms + tf_ms * MAX_BARS_PER_CALL - 1, now_ms)
-        raw = fetch_klines(symbol, interval, current_ms, chunk_end)
-        if not raw:
-            break
+    with open(out_path, "w", buffering=1) as csv_fh:   # line-buffered = flush each row
+        while current_ms < now_ms:
+            chunk_end = min(current_ms + tf_ms * MAX_BARS_PER_CALL - 1, now_ms)
+            raw = fetch_klines(symbol, interval, current_ms, chunk_end)
+            if not raw:
+                break
 
-        df = klines_to_df(raw)
-        all_frames.append(df)
-        fetched += len(df)
+            df = klines_to_df(raw)
 
-        last_close_ms = int(df["close_time"].iloc[-1].timestamp() * 1000)
-        current_ms = last_close_ms + 1
+            # deduplicate without storing full df in a list
+            df = df[~df["open_time"].isin(seen_times)]
+            seen_times.update(df["open_time"].tolist())
 
-        pct = min(100, (fetched / total_bars) * 100)
-        log.info(f"  [{interval}] {fetched:,}/{total_bars:,} bars  ({pct:.1f}%)")
+            if df.empty:
+                break
 
-        time.sleep(REQUEST_DELAY_S)
+            # write header only on first chunk, then append rows
+            df.to_csv(csv_fh, index=False, header=first_chunk)
+            first_chunk = False
+            fetched += len(df)
 
-    result = pd.concat(all_frames, ignore_index=True).drop_duplicates("open_time")
-    result.to_csv(out_path, index=False)
-    log.info(f"  ✅ [{interval}] Saved {len(result):,} rows → {out_path}")
+            last_close_ms = int(df["close_time"].iloc[-1].timestamp() * 1000)
+            current_ms    = last_close_ms + 1
+
+            pct = min(100, (fetched / total_bars) * 100)
+            log.info(f"  [{interval}] {fetched:,}/{total_bars:,} bars  ({pct:.1f}%)")
+
+            # explicitly free chunk memory before next iteration
+            del df, raw
+
+            time.sleep(REQUEST_DELAY_S)
+
+    log.info(f"  ✅ [{interval}] Saved {fetched:,} rows → {out_path}")
     return out_path
 
 
@@ -231,14 +275,14 @@ async def send_message_telegram(bot: telegram.Bot, chat_id: str, text: str):
 async def main():
     bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # Announce start
     await send_message_telegram(
         bot, TELEGRAM_CHAT_ID,
         f"🚀 <b>Binance Downloader Started</b>\n"
         f"Symbol: <code>{SYMBOL}</code>\n"
         f"Timeframes: {', '.join(TIMEFRAMES)}\n"
         f"History: {YEARS_BACK} years\n"
-        f"Started at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        f"Mode: streaming (low-memory)\n"
+        f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
     overall_start = time.time()
@@ -252,7 +296,7 @@ async def main():
         csv_path = download_timeframe(SYMBOL, tf, YEARS_BACK)
 
         elapsed = time.time() - tf_start
-        rows    = sum(1 for _ in open(csv_path)) - 1  # subtract header
+        rows    = sum(1 for _ in open(csv_path)) - 1
         size_mb = csv_path.stat().st_size / 1_048_576
 
         caption = (
