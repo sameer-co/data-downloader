@@ -1,322 +1,526 @@
 #!/usr/bin/env python3
 """
-Binance Historical Data Downloader with Telegram Notifications
-- Downloads 6 years of OHLCV data for timeframes: 1h, 15m, 5m, 3m (largest first)
-- Streams each chunk directly to disk — no OOM from accumulating DataFrames
-- Respects Binance rate limits with auto back-off on 429/418
-- Sends each completed CSV file to Telegram after download
-- Self-installs all dependencies
+SOLUSDC 1-Minute RSI(28)/EMA(13) Crossover Backtest
+=====================================================
+
+Strategy
+--------
+- Indicator: RSI(28) and a 13-period EMA of that RSI line.
+- Entry (LONG ONLY): when RSI(28) crosses ABOVE its 13 EMA -> BUY at the
+  close of the signal candle (next-bar-open execution is also supported,
+  see EXECUTION_MODE below).
+- Stop Loss: low of the candle immediately BEFORE the signal/trigger candle.
+- Take Profit: entry + 2.2 * (entry - stop_loss)   [Risk:Reward = 1 : 2.2]
+- Costs: 0.06% total round-trip cost (entry + exit combined), applied as a
+  simple percentage drag on the trade's gross return.
+- Position sizing: FULL ACCOUNT, COMPOUNDING (spot-style, no leverage,
+  no shorting, one position open at a time). Every trade risks 100% of
+  current equity (you chose this explicitly to see compounding behavior --
+  see the warning printed at runtime).
+- Account starts at $100.
+
+Data
+----
+Binance public REST API, no API key required:
+  GET https://api.binance.com/api/v3/klines
+Symbol: SOLUSDC, Interval: 1m, Range: last 365 days (auto, paginated).
+Data is cached to a local CSV (solusdc_1m_1y.csv) so re-runs don't
+re-download ~525,600 candles every time.
+
+Dependencies
+------------
+This script installs any missing dependencies itself on first run
+(pandas, numpy, requests). No manual `pip install` needed.
+
+Usage
+-----
+    python3 solusdc_rsi_ema_backtest.py
+
+Optional flags:
+    --refresh           Force re-download of data (ignore cache)
+    --execution close   Enter at signal-candle CLOSE (default)
+    --execution next    Enter at NEXT candle OPEN (more realistic, avoids lookahead)
 """
 
-import subprocess
 import sys
+import subprocess
+import importlib
+import argparse
 import os
-
-# ─────────────────────────────────────────────
-# SELF-INSTALL DEPENDENCIES
-# ─────────────────────────────────────────────
-# map pip package name -> actual importable module name
-REQUIRED = {
-    "requests": "requests",
-    "pandas": "pandas",
-    "python-telegram-bot": "telegram",
-}
-
-def _pip_install(pkg: str) -> bool:
-    """Try a normal pip install; return True on success."""
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-def install_dependencies():
-    print("📦 Checking and installing dependencies...")
-    for pip_name, import_name in REQUIRED.items():
-        try:
-            __import__(import_name)
-            print(f"  ✅ {pip_name} already installed")
-            continue
-        except ImportError:
-            pass
-
-        print(f"  ⬇️  Installing {pip_name}...")
-        if _pip_install(pip_name):
-            print(f"  ✅ {pip_name} installed")
-            continue
-
-        # Some systems (PEP 668 / externally-managed) need this flag
-        print(f"  ↻ Retrying {pip_name} with --break-system-packages ...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pip_name,
-                 "--break-system-packages", "--quiet"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print(f"  ✅ {pip_name} installed")
-        except subprocess.CalledProcessError:
-            print(f"  ❌ Failed to install {pip_name}. "
-                  f"Try manually: pip install {pip_name} --break-system-packages")
-            sys.exit(1)
-
-install_dependencies()
-
-# ─────────────────────────────────────────────
-# IMPORTS (after install)
-# ─────────────────────────────────────────────
 import time
-import math
-import asyncio
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
-import requests
-import pandas as pd
-import telegram
-
-# ─────────────────────────────────────────────
-# ⚙️  USER CONFIGURATION — edit these
-# ─────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg"
-TELEGRAM_CHAT_ID   = "1950462171"
-
-SYMBOL      = "BTCUSDT"                        # Binance trading pair
-TIMEFRAMES  = ["1h", "15m", "5m", "3m"]        # 1m removed; largest tf first (low memory)
-OUTPUT_DIR  = Path("binance_data")             # folder for CSV files
-YEARS_BACK  = 6                                # how many years of history
-
-# Binance REST limits
-# Spot: 1200 weight/min; each klines call = 2 weight
-# Safe: ~500 calls/min → sleep ~0.12s between calls
-# We use 0.2s to be conservative
-REQUEST_DELAY_S   = 0.2    # seconds between API calls
-MAX_BARS_PER_CALL = 1000   # Binance max klines limit
-# ─────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-BINANCE_BASE = "https://api.binance.com"
-
-TF_MS = {
-    "3m":  180_000,
-    "5m":  300_000,
-    "15m": 900_000,
-    "1h":  3_600_000,
+# ---------------------------------------------------------------------------
+# 0. SELF-INSTALLING DEPENDENCIES
+# ---------------------------------------------------------------------------
+REQUIRED = {
+    "pandas": "pandas",
+    "numpy": "numpy",
+    "requests": "requests",
 }
 
-
-# ─────────────────────────────────────────────
-# BINANCE HELPERS
-# ─────────────────────────────────────────────
-
-def get_server_time() -> int:
-    """Return Binance server time in ms."""
-    r = requests.get(f"{BINANCE_BASE}/api/v3/time", timeout=10)
-    r.raise_for_status()
-    return r.json()["serverTime"]
-
-
-def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list:
-    """
-    Fetch up to MAX_BARS_PER_CALL klines from Binance.
-    Handles 429/418 rate-limit responses with exponential back-off.
-    """
-    params = {
-        "symbol":    symbol,
-        "interval":  interval,
-        "startTime": start_ms,
-        "endTime":   end_ms,
-        "limit":     MAX_BARS_PER_CALL,
-    }
-    backoff = 5
-    while True:
+def ensure_dependencies():
+    missing = []
+    for import_name, pip_name in REQUIRED.items():
         try:
-            r = requests.get(
-                f"{BINANCE_BASE}/api/v3/klines",
-                params=params,
-                timeout=20,
-            )
-            if r.status_code == 429:
-                retry_after = int(r.headers.get("Retry-After", backoff))
-                log.warning(f"⚠️  Rate-limited (429). Sleeping {retry_after}s …")
-                time.sleep(retry_after)
-                backoff = min(backoff * 2, 120)
-                continue
-            if r.status_code == 418:
-                log.warning(f"🚫 IP banned (418). Sleeping {backoff}s …")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as exc:
-            log.error(f"Request error: {exc}. Retrying in {backoff}s …")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            importlib.import_module(import_name)
+        except ImportError:
+            missing.append(pip_name)
+    if missing:
+        print(f"[setup] Installing missing dependencies: {', '.join(missing)} ...")
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        # --break-system-packages is needed on some externally-managed Python
+        # installs (PEP 668, e.g. recent Debian/Ubuntu). Try normal install
+        # first, fall back if it fails.
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            cmd_alt = cmd + ["--break-system-packages"]
+            result2 = subprocess.run(cmd_alt, capture_output=True, text=True)
+            if result2.returncode != 0:
+                print("[setup] ERROR installing dependencies:")
+                print(result.stderr)
+                print(result2.stderr)
+                sys.exit(1)
+        print("[setup] Dependencies installed.")
+
+ensure_dependencies()
+
+import numpy as np
+import pandas as pd
+import requests
+
+# ---------------------------------------------------------------------------
+# 1. CONFIG
+# ---------------------------------------------------------------------------
+SYMBOL = "SOLUSDC"
+INTERVAL = "1m"
+DAYS_BACK = 365
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solusdc_1m_1y.csv")
+
+RSI_LEN = 28
+EMA_LEN = 13
+RR_MULTIPLE = 2.2          # target = entry + RR_MULTIPLE * risk
+ROUND_TRIP_COST_PCT = 0.06 / 100.0   # 0.06% total (entry+exit combined)
+STARTING_EQUITY = 100.0
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+MAX_LIMIT = 1000  # Binance max candles per request
 
 
-def klines_to_df(raw: list) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# 2. DATA DOWNLOAD (Binance public API, paginated, cached)
+# ---------------------------------------------------------------------------
+def download_binance_klines(symbol=SYMBOL, interval=INTERVAL, days_back=DAYS_BACK):
+    """
+    Downloads `days_back` days of historical klines from Binance's public
+    REST API (no API key needed) and returns a clean OHLCV DataFrame.
+    Paginates in chunks of MAX_LIMIT candles, respecting rate limits.
+    """
+    end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_time = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp() * 1000)
+
+    all_rows = []
+    cur_start = start_time
+    session = requests.Session()
+    request_count = 0
+
+    print(f"[data] Downloading {days_back}d of {interval} {symbol} klines from Binance...")
+
+    while cur_start < end_time:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur_start,
+            "limit": MAX_LIMIT,
+        }
+        for attempt in range(5):
+            try:
+                resp = session.get(BINANCE_KLINES_URL, params=params, timeout=15)
+                if resp.status_code == 200:
+                    break
+                elif resp.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    print(f"[data] Rate limited, waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"[data] HTTP {resp.status_code}: {resp.text[:200]}")
+                    time.sleep(2)
+            except requests.exceptions.RequestException as e:
+                print(f"[data] Request error: {e}, retrying...")
+                time.sleep(3)
+        else:
+            raise RuntimeError("Failed to fetch klines after multiple retries.")
+
+        batch = resp.json()
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        last_open_time = batch[-1][0]
+        cur_start = last_open_time + 1  # next page starts right after last candle
+        request_count += 1
+
+        if request_count % 20 == 0:
+            pct = min(100.0, (cur_start - start_time) / (end_time - start_time) * 100)
+            print(f"[data] ...{len(all_rows):,} candles fetched ({pct:.1f}%)")
+
+        # Be polite to the API (well under the 1200 req/min weight limit)
+        time.sleep(0.05)
+
+        if len(batch) < MAX_LIMIT:
+            # short batch usually means we've caught up to "now"
+            if cur_start >= end_time:
+                break
+
+    print(f"[data] Download complete: {len(all_rows):,} candles.")
+
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base_vol", "taker_buy_quote_vol", "ignore",
+        "taker_buy_base", "taker_buy_quote", "ignore"
     ]
-    df = pd.DataFrame(raw, columns=cols)
-    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
+    df = pd.DataFrame(all_rows, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    for c in ["open", "high", "low", "close", "volume",
-              "quote_asset_volume", "taker_buy_base_vol", "taker_buy_quote_vol"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = df[c].astype(float)
-    df["num_trades"] = df["num_trades"].astype(int)
-    return df[["open_time", "open", "high", "low", "close", "volume",
-               "quote_asset_volume", "num_trades", "close_time"]]
+
+    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
+    df = df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
+    return df
 
 
-def download_timeframe(symbol: str, interval: str, years: int) -> Path:
+def load_data(refresh=False):
+    if (not refresh) and os.path.exists(CACHE_FILE):
+        print(f"[data] Loading cached data from {CACHE_FILE}")
+        df = pd.read_csv(CACHE_FILE, parse_dates=["open_time", "close_time"])
+        age_days = (datetime.now(timezone.utc) - df["open_time"].max().tz_convert("UTC")).total_seconds() / 86400
+        print(f"[data] Cached data spans {df['open_time'].min()} -> {df['open_time'].max()} "
+              f"({len(df):,} rows, newest candle is {age_days:.1f} days old)")
+        return df
+
+    df = download_binance_klines()
+    df.to_csv(CACHE_FILE, index=False)
+    print(f"[data] Saved cache to {CACHE_FILE}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 3. INDICATORS
+# ---------------------------------------------------------------------------
+def compute_rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    """Classic Wilder RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)          # no losses -> RSI 100
+    rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)  # flat -> 50
+    return rsi
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["rsi"] = compute_rsi(df["close"], RSI_LEN)
+    df["rsi_ema"] = df["rsi"].ewm(span=EMA_LEN, adjust=False).mean()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. BACKTEST ENGINE
+# ---------------------------------------------------------------------------
+def run_backtest(df: pd.DataFrame, execution_mode: str = "close"):
     """
-    Download `years` of klines for the given interval.
-    ✅ Streams each chunk directly to CSV — no full dataset held in RAM.
-    Saves to OUTPUT_DIR/<symbol>_<interval>_6y.csv and returns the path.
+    execution_mode:
+      'close' -> enter at the close of the signal candle (the candle where
+                 the crossover is confirmed). Simpler, but technically
+                 assumes you can transact exactly at the closing price.
+      'next'  -> enter at the OPEN of the candle AFTER the signal candle.
+                 More realistic (no lookahead), since the signal candle's
+                 close isn't known until it closes.
+
+    Rules (long only):
+      - Signal: rsi crosses above rsi_ema on the signal candle (rsi[i-1] <= ema[i-1]
+        and rsi[i] > ema[i]).
+      - Entry price: signal candle close ('close' mode) or next candle open ('next' mode).
+      - Stop loss: low of the candle immediately BEFORE the signal candle (index i-1).
+      - Take profit: entry + 2.2 * (entry - stop_loss).
+      - Only one position open at a time (no pyramiding/overlapping trades).
+      - Exit check uses high/low of subsequent candles; if both TP and SL are
+        touched within the same candle, SL is assumed hit first (conservative).
+      - Round trip cost (0.06%) deducted from gross trade return.
+      - Position size = 100% of current equity (full compounding, spot-style,
+        no leverage).
     """
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"{symbol}_{interval}_{years}y.csv"
+    n = len(df)
+    rsi = df["rsi"].values
+    ema = df["rsi_ema"].values
+    high = df["high"].values
+    low = df["low"].values
+    close = df["close"].values
+    openp = df["open"].values
+    times = df["open_time"].values
 
-    now_ms   = get_server_time()
-    tf_ms    = TF_MS[interval]
-    start_ms = now_ms - years * 365 * 24 * 3600 * 1000
+    trades = []
+    equity = STARTING_EQUITY
+    equity_curve = [(times[0], equity)]
 
-    total_bars   = (now_ms - start_ms) // tf_ms
-    calls_needed = math.ceil(total_bars / MAX_BARS_PER_CALL)
+    in_position = False
+    i = max(RSI_LEN, EMA_LEN) + 2  # warmup
 
-    log.info(
-        f"📥 [{interval}] ~{total_bars:,} bars over {calls_needed} API calls "
-        f"— streaming to disk (low-memory mode) …"
-    )
+    while i < n - 1:
+        if not in_position:
+            # crossover check: rsi was <= ema, now > ema
+            if (not np.isnan(rsi[i - 1])) and (not np.isnan(ema[i - 1])) and \
+               (not np.isnan(rsi[i])) and (not np.isnan(ema[i])):
+                crossed_up = (rsi[i - 1] <= ema[i - 1]) and (rsi[i] > ema[i])
+            else:
+                crossed_up = False
 
-    current_ms  = start_ms
-    fetched     = 0
-    first_chunk = True
-    seen_times  = set()   # lightweight dedup: only store timestamps
+            if crossed_up:
+                signal_idx = i
+                sl_price = low[signal_idx - 1]  # previous (trigger-1) candle low
 
-    with open(out_path, "w", buffering=1) as csv_fh:   # line-buffered = flush each row
-        while current_ms < now_ms:
-            chunk_end = min(current_ms + tf_ms * MAX_BARS_PER_CALL - 1, now_ms)
-            raw = fetch_klines(symbol, interval, current_ms, chunk_end)
-            if not raw:
-                break
+                if execution_mode == "close":
+                    entry_idx = signal_idx
+                    entry_price = close[signal_idx]
+                else:  # 'next'
+                    entry_idx = signal_idx + 1
+                    if entry_idx >= n:
+                        break
+                    entry_price = openp[entry_idx]
 
-            df = klines_to_df(raw)
+                risk = entry_price - sl_price
+                if risk <= 0:
+                    # invalid setup (SL above/at entry) -> skip this signal
+                    i += 1
+                    continue
 
-            # deduplicate without storing full df in a list
-            df = df[~df["open_time"].isin(seen_times)]
-            seen_times.update(df["open_time"].tolist())
+                tp_price = entry_price + RR_MULTIPLE * risk
 
-            if df.empty:
-                break
+                # walk forward from the bar after entry to find exit
+                exit_idx = None
+                exit_price = None
+                exit_reason = None
+                j = entry_idx + 1
+                while j < n:
+                    hit_sl = low[j] <= sl_price
+                    hit_tp = high[j] >= tp_price
+                    if hit_sl and hit_tp:
+                        # conservative assumption: SL hit first
+                        exit_idx, exit_price, exit_reason = j, sl_price, "SL"
+                        break
+                    elif hit_sl:
+                        exit_idx, exit_price, exit_reason = j, sl_price, "SL"
+                        break
+                    elif hit_tp:
+                        exit_idx, exit_price, exit_reason = j, tp_price, "TP"
+                        break
+                    j += 1
 
-            # write header only on first chunk, then append rows
-            df.to_csv(csv_fh, index=False, header=first_chunk)
-            first_chunk = False
-            fetched += len(df)
+                if exit_idx is None:
+                    # ran out of data before resolving -> close at last available price
+                    exit_idx = n - 1
+                    exit_price = close[exit_idx]
+                    exit_reason = "EOD_FORCE_CLOSE"
 
-            last_close_ms = int(df["close_time"].iloc[-1].timestamp() * 1000)
-            current_ms    = last_close_ms + 1
+                gross_ret = (exit_price - entry_price) / entry_price
+                net_ret = gross_ret - ROUND_TRIP_COST_PCT  # full round-trip cost on the trade
 
-            pct = min(100, (fetched / total_bars) * 100)
-            log.info(f"  [{interval}] {fetched:,}/{total_bars:,} bars  ({pct:.1f}%)")
+                pnl_dollars = equity * net_ret
+                equity_before = equity
+                equity = equity + pnl_dollars
 
-            # explicitly free chunk memory before next iteration
-            del df, raw
+                trades.append({
+                    "signal_time": times[signal_idx],
+                    "entry_time": times[entry_idx],
+                    "exit_time": times[exit_idx],
+                    "entry_price": entry_price,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
+                    "exit_price": exit_price,
+                    "exit_reason": exit_reason,
+                    "risk_pct": risk / entry_price,
+                    "gross_return_pct": gross_ret,
+                    "net_return_pct": net_ret,
+                    "equity_before": equity_before,
+                    "equity_after": equity,
+                    "pnl_dollars": pnl_dollars,
+                    "bars_held": exit_idx - entry_idx,
+                })
+                equity_curve.append((times[exit_idx], equity))
 
-            time.sleep(REQUEST_DELAY_S)
+                i = exit_idx + 1  # no overlapping trades
+                continue
+        i += 1
 
-    log.info(f"  ✅ [{interval}] Saved {fetched:,} rows → {out_path}")
-    return out_path
-
-
-# ─────────────────────────────────────────────
-# TELEGRAM HELPERS
-# ─────────────────────────────────────────────
-
-async def send_file_telegram(bot: telegram.Bot, chat_id: str, path: Path, caption: str):
-    size_mb = path.stat().st_size / 1_048_576
-    log.info(f"📤 Sending {path.name} ({size_mb:.2f} MB) to Telegram …")
-    with open(path, "rb") as fh:
-        await bot.send_document(
-            chat_id=chat_id,
-            document=fh,
-            filename=path.name,
-            caption=caption,
-            read_timeout=120,
-            write_timeout=120,
-        )
-    log.info(f"  ✅ Sent {path.name}")
-
-
-async def send_message_telegram(bot: telegram.Bot, chat_id: str, text: str):
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(equity_curve, columns=["time", "equity"])
+    return trades_df, equity_df
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 5. METRICS
+# ---------------------------------------------------------------------------
+def max_drawdown(equity_series: pd.Series):
+    running_max = equity_series.cummax()
+    dd = (equity_series - running_max) / running_max
+    return dd.min(), dd.idxmin()
 
-async def main():
-    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
-    await send_message_telegram(
-        bot, TELEGRAM_CHAT_ID,
-        f"🚀 <b>Binance Downloader Started</b>\n"
-        f"Symbol: <code>{SYMBOL}</code>\n"
-        f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-        f"History: {YEARS_BACK} years\n"
-        f"Mode: streaming (low-memory)\n"
-        f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
+def compute_metrics(trades_df: pd.DataFrame, equity_df: pd.DataFrame, starting_equity: float):
+    if trades_df.empty:
+        print("No trades were generated. Try a longer period or check the data.")
+        return {}
 
-    overall_start = time.time()
+    n_trades = len(trades_df)
+    wins = trades_df[trades_df["net_return_pct"] > 0]
+    losses = trades_df[trades_df["net_return_pct"] <= 0]
 
-    for tf in TIMEFRAMES:
-        tf_start = time.time()
-        log.info(f"\n{'='*50}")
-        log.info(f"Starting timeframe: {tf}")
-        log.info(f"{'='*50}")
+    n_wins = len(wins)
+    n_losses = len(losses)
+    win_rate = n_wins / n_trades * 100
 
-        csv_path = download_timeframe(SYMBOL, tf, YEARS_BACK)
+    final_equity = equity_df["equity"].iloc[-1]
+    total_pnl_dollars = final_equity - starting_equity
+    total_return_pct = (final_equity / starting_equity - 1) * 100
 
-        elapsed = time.time() - tf_start
-        rows    = sum(1 for _ in open(csv_path)) - 1
-        size_mb = csv_path.stat().st_size / 1_048_576
+    avg_win_pct = wins["net_return_pct"].mean() * 100 if n_wins > 0 else 0.0
+    avg_loss_pct = losses["net_return_pct"].mean() * 100 if n_losses > 0 else 0.0
+    avg_win_dollars = wins["pnl_dollars"].mean() if n_wins > 0 else 0.0
+    avg_loss_dollars = losses["pnl_dollars"].mean() if n_losses > 0 else 0.0
 
-        caption = (
-            f"✅ <b>{SYMBOL} — {tf} ({YEARS_BACK}y)</b>\n"
-            f"Rows: {rows:,}\n"
-            f"Size: {size_mb:.2f} MB\n"
-            f"Duration: {elapsed/60:.1f} min"
-        )
+    gross_profit = wins["pnl_dollars"].sum() if n_wins > 0 else 0.0
+    gross_loss = -losses["pnl_dollars"].sum() if n_losses > 0 else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
 
-        await send_file_telegram(bot, TELEGRAM_CHAT_ID, csv_path, caption)
+    # Expectancy (EV) per trade, in % return terms and in $ terms
+    ev_pct = (win_rate / 100 * avg_win_pct) + ((1 - win_rate / 100) * avg_loss_pct)
+    ev_dollars = trades_df["pnl_dollars"].mean()
 
-    total_elapsed = time.time() - overall_start
-    await send_message_telegram(
-        bot, TELEGRAM_CHAT_ID,
-        f"🎉 <b>All downloads complete!</b>\n"
-        f"Total time: {total_elapsed/60:.1f} min\n"
-        f"Files saved in: <code>{OUTPUT_DIR.resolve()}</code>"
-    )
-    log.info(f"\n🎉 All done in {total_elapsed/60:.1f} min")
+    # average R multiple actually achieved (using each trade's own risk)
+    trades_df = trades_df.copy()
+    trades_df["r_multiple"] = trades_df["net_return_pct"] / trades_df["risk_pct"].replace(0, np.nan)
+    avg_r = trades_df["r_multiple"].mean()
+    expectancy_r = (win_rate / 100) * RR_MULTIPLE - (1 - win_rate / 100) * 1  # theoretical R-based EV
+
+    largest_win = trades_df["pnl_dollars"].max()
+    largest_loss = trades_df["pnl_dollars"].min()
+
+    max_dd_pct, max_dd_time_idx = max_drawdown(equity_df["equity"])
+    max_dd_time = equity_df.loc[max_dd_time_idx, "time"] if not equity_df.empty else None
+
+    # Consecutive wins/losses
+    streak = (trades_df["net_return_pct"] > 0).astype(int)
+    max_consec_win = max_consec_loss = cur_win = cur_loss = 0
+    for v in streak:
+        if v == 1:
+            cur_win += 1; cur_loss = 0
+            max_consec_win = max(max_consec_win, cur_win)
+        else:
+            cur_loss += 1; cur_win = 0
+            max_consec_loss = max(max_consec_loss, cur_loss)
+
+    avg_bars_held = trades_df["bars_held"].mean()
+
+    # Sharpe-like ratio on per-trade returns (not annualized to a clean period
+    # since trade frequency is irregular; shown as per-trade Sharpe)
+    ret_std = trades_df["net_return_pct"].std()
+    sharpe_per_trade = trades_df["net_return_pct"].mean() / ret_std if ret_std > 0 else np.nan
+
+    # CAGR based on actual elapsed time of the data
+    start_time = equity_df["time"].iloc[0]
+    end_time = equity_df["time"].iloc[-1]
+    elapsed_days = (pd.to_datetime(end_time) - pd.to_datetime(start_time)).total_seconds() / 86400
+    elapsed_years = elapsed_days / 365.25 if elapsed_days > 0 else np.nan
+    cagr = ((final_equity / starting_equity) ** (1 / elapsed_years) - 1) * 100 if elapsed_years and elapsed_years > 0 else np.nan
+
+    metrics = {
+        "Total trades": n_trades,
+        "Winning trades": n_wins,
+        "Losing trades": n_losses,
+        "Win rate (%)": win_rate,
+        "Starting equity ($)": starting_equity,
+        "Final equity ($)": final_equity,
+        "Total P&L ($)": total_pnl_dollars,
+        "Total return (%)": total_return_pct,
+        "CAGR (%) [approx, compounding]": cagr,
+        "Avg win (%)": avg_win_pct,
+        "Avg loss (%)": avg_loss_pct,
+        "Avg win ($, at time of trade)": avg_win_dollars,
+        "Avg loss ($, at time of trade)": avg_loss_dollars,
+        "Largest win ($)": largest_win,
+        "Largest loss ($)": largest_loss,
+        "Gross profit ($, sum of winning trades)": gross_profit,
+        "Gross loss ($, sum of losing trades)": gross_loss,
+        "Profit factor": profit_factor,
+        "Expectancy / EV per trade (%)": ev_pct,
+        "Expectancy / EV per trade ($, at time of trade)": ev_dollars,
+        "Theoretical R-based expectancy (R per trade)": expectancy_r,
+        "Avg realized R-multiple per trade": avg_r,
+        "Max drawdown (%)": max_dd_pct * 100,
+        "Max drawdown date": max_dd_time,
+        "Max consecutive wins": max_consec_win,
+        "Max consecutive losses": max_consec_loss,
+        "Avg bars held (minutes)": avg_bars_held,
+        "Per-trade Sharpe (mean/std of trade returns)": sharpe_per_trade,
+        "Exit reason breakdown": trades_df["exit_reason"].value_counts().to_dict(),
+    }
+    return metrics
+
+
+def print_report(metrics: dict):
+    print("\n" + "=" * 70)
+    print(" BACKTEST RESULTS: SOLUSDC 1m | RSI(28)/EMA(13) crossover | Long-only")
+    print("=" * 70)
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"{k:<55}: {v:,.4f}")
+        else:
+            print(f"{k:<55}: {v}")
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# 6. MAIN
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="SOLUSDC RSI/EMA crossover backtest")
+    parser.add_argument("--refresh", action="store_true", help="Force re-download data, ignore cache")
+    parser.add_argument("--execution", choices=["close", "next"], default="close",
+                         help="Entry execution mode: 'close' of signal candle or 'next' candle open")
+    args = parser.parse_args()
+
+    print("\n*** IMPORTANT: position sizing = 100% of current equity per trade ***")
+    print("*** (full compounding, no leverage, spot-style, one trade at a time) ***")
+    print("*** This is what you asked for, but note it means a single bad trade")
+    print("*** can wipe out a large fraction of the account. Review results")
+    print("*** carefully before considering this for real capital. ***\n")
+
+    df = load_data(refresh=args.refresh)
+    df = add_indicators(df)
+
+    trades_df, equity_df = run_backtest(df, execution_mode=args.execution)
+
+    if trades_df.empty:
+        print("No trades generated.")
+        return
+
+    metrics = compute_metrics(trades_df, equity_df, STARTING_EQUITY)
+    print_report(metrics)
+
+    out_trades = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades_log.csv")
+    trades_df.to_csv(out_trades, index=False)
+    print(f"\nFull trade log saved to: {out_trades}")
+
+    out_equity = os.path.join(os.path.dirname(os.path.abspath(__file__)), "equity_curve.csv")
+    equity_df.to_csv(out_equity, index=False)
+    print(f"Equity curve saved to: {out_equity}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
