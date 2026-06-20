@@ -93,15 +93,15 @@ import requests
 # 1. CONFIG
 # ---------------------------------------------------------------------------
 SYMBOL = "SOLUSDC"
-INTERVAL = "3m"
+INTERVAL = "1m"
 DAYS_BACK = 365
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solusdc_1m_1y.csv")
 
 RSI_LEN = 28
 EMA_LEN = 13
-RR_MULTIPLE = 2.2          # target = entry + RR_MULTIPLE * risk
+RR_MULTIPLE = 3          # target = entry + RR_MULTIPLE * risk
 ROUND_TRIP_COST_PCT = 0.06 / 100.0   # 0.06% total (entry+exit combined)
-STARTING_EQUITY = 100.0
+STARTING_EQUITY = 10000.0
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 MAX_LIMIT = 1000  # Binance max candles per request
 
