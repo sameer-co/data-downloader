@@ -93,7 +93,7 @@ import requests
 # 1. CONFIG
 # ---------------------------------------------------------------------------
 SYMBOL = "SOLUSDC"
-INTERVAL = "1m"
+INTERVAL = "3m"
 DAYS_BACK = 365
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solusdc_1m_1y.csv")
 
