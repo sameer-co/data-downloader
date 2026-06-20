@@ -35,11 +35,16 @@ This script installs any missing dependencies itself on first run
 Usage
 -----
     python3 solusdc_rsi_ema_backtest.py
+    python3 solusdc_rsi_ema_backtest.py --multi-tf
 
 Optional flags:
     --refresh           Force re-download of data (ignore cache)
     --execution close   Enter at signal-candle CLOSE (default)
     --execution next    Enter at NEXT candle OPEN (more realistic, avoids lookahead)
+    --multi-tf           Run on 1m/3m/5m/15m (derived from the same 1m data)
+                          and print a comparison matrix (P&L, profit, loss,
+                          trade count, win rate, EV) to find the most
+                          profitable timeframe.
 """
 
 import sys
@@ -99,9 +104,9 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solusdc_1
 
 RSI_LEN = 28
 EMA_LEN = 13
-RR_MULTIPLE = 3          # target = entry + RR_MULTIPLE * risk
+RR_MULTIPLE = 2.2          # target = entry + RR_MULTIPLE * risk
 ROUND_TRIP_COST_PCT = 0.06 / 100.0   # 0.06% total (entry+exit combined)
-STARTING_EQUITY = 10000.0
+STARTING_EQUITY = 100.0
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 MAX_LIMIT = 1000  # Binance max candles per request
 
@@ -202,6 +207,26 @@ def load_data(refresh=False):
     df.to_csv(CACHE_FILE, index=False)
     print(f"[data] Saved cache to {CACHE_FILE}")
     return df
+
+
+def resample_ohlc(df_1m: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Derives a higher timeframe (e.g. '3min', '5min', '15min') from 1-minute
+    OHLCV data. Using the same underlying 1m data for every timeframe keeps
+    the comparison fair (identical price history, just different candle
+    aggregation), instead of pulling each timeframe separately from Binance.
+    """
+    d = df_1m.set_index("open_time").sort_index()
+    out = d.resample(rule, label="left", closed="left").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
+    out = out.reset_index()
+    out["close_time"] = out["open_time"] + pd.to_timedelta(rule) - pd.Timedelta(milliseconds=1)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +510,86 @@ def print_report(metrics: dict):
     print("=" * 70)
 
 
+def extract_summary_row(metrics: dict, label: str) -> dict:
+    """Pulls just the headline fields requested for the timeframe comparison
+    matrix: P&L, total profit, total loss, number of trades, win rate, EV."""
+    if not metrics:
+        return {
+            "Timeframe": label, "Trades": 0, "Win Rate (%)": np.nan,
+            "Total P&L ($)": np.nan, "Total Profit ($)": np.nan,
+            "Total Loss ($)": np.nan, "EV per trade (%)": np.nan,
+            "EV per trade ($)": np.nan, "Final Equity ($)": np.nan,
+            "Profit Factor": np.nan, "Max Drawdown (%)": np.nan,
+        }
+    return {
+        "Timeframe": label,
+        "Trades": metrics["Total trades"],
+        "Win Rate (%)": metrics["Win rate (%)"],
+        "Total P&L ($)": metrics["Total P&L ($)"],
+        "Total Profit ($)": metrics["Gross profit ($, sum of winning trades)"],
+        "Total Loss ($)": metrics["Gross loss ($, sum of losing trades)"],
+        "EV per trade (%)": metrics["Expectancy / EV per trade (%)"],
+        "EV per trade ($)": metrics["Expectancy / EV per trade ($, at time of trade)"],
+        "Final Equity ($)": metrics["Final equity ($)"],
+        "Profit Factor": metrics["Profit factor"],
+        "Max Drawdown (%)": metrics["Max drawdown (%)"],
+    }
+
+
+def run_multi_timeframe(df_1m: pd.DataFrame, timeframes: dict, execution_mode: str = "close"):
+    """
+    Runs the full strategy independently on each timeframe (each one gets
+    its own RSI/EMA computed on its own candles, its own crossovers, its
+    own trades) and returns a comparison DataFrame plus a dict of
+    {label: (trades_df, equity_df, metrics)} for deeper inspection.
+    """
+    rows = []
+    details = {}
+
+    for label, rule in timeframes.items():
+        print(f"\n[multi-tf] Processing {label} ({rule}) ...")
+        if rule == "1min":
+            tf_df = df_1m.copy()
+        else:
+            tf_df = resample_ohlc(df_1m, rule)
+
+        tf_df = add_indicators(tf_df)
+        trades_df, equity_df = run_backtest(tf_df, execution_mode=execution_mode)
+        metrics = compute_metrics(trades_df, equity_df, STARTING_EQUITY) if not trades_df.empty else {}
+
+        rows.append(extract_summary_row(metrics, label))
+        details[label] = (trades_df, equity_df, metrics)
+        print(f"[multi-tf] {label}: {len(trades_df)} trades, "
+              f"win rate {metrics.get('Win rate (%)', float('nan')):.2f}%, "
+              f"P&L ${metrics.get('Total P&L ($)', float('nan')):.2f}" if metrics else
+              f"[multi-tf] {label}: no trades generated")
+
+    matrix_df = pd.DataFrame(rows).set_index("Timeframe")
+    return matrix_df, details
+
+
+def print_matrix(matrix_df: pd.DataFrame):
+    print("\n" + "=" * 100)
+    print(" MULTI-TIMEFRAME COMPARISON: SOLUSDC | RSI(28)/EMA(13) crossover | Long-only")
+    print(" (Most profitable timeframe = highest Total P&L / highest EV, watch Max Drawdown too)")
+    print("=" * 100)
+    with pd.option_context("display.float_format", "{:,.4f}".format,
+                            "display.max_columns", None,
+                            "display.width", 140):
+        print(matrix_df)
+    print("=" * 100)
+
+    if matrix_df["Total P&L ($)"].notna().any():
+        best_pnl = matrix_df["Total P&L ($)"].idxmax()
+        best_ev = matrix_df["EV per trade (%)"].idxmax()
+        print(f"\nHighest Total P&L:        {best_pnl}  (${matrix_df.loc[best_pnl, 'Total P&L ($)']:.2f})")
+        print(f"Highest EV per trade (%): {best_ev}  ({matrix_df.loc[best_ev, 'EV per trade (%)']:.4f}%)")
+        if best_pnl != best_ev:
+            print("Note: highest total P&L and highest per-trade EV point to different "
+                  "timeframes here -- total P&L also depends on how many trades fired, "
+                  "so a lower-EV timeframe can still win on P&L if it traded much more often.")
+
+
 # ---------------------------------------------------------------------------
 # 6. MAIN
 # ---------------------------------------------------------------------------
@@ -493,6 +598,10 @@ def main():
     parser.add_argument("--refresh", action="store_true", help="Force re-download data, ignore cache")
     parser.add_argument("--execution", choices=["close", "next"], default="close",
                          help="Entry execution mode: 'close' of signal candle or 'next' candle open")
+    parser.add_argument("--multi-tf", action="store_true",
+                         help="Run the strategy on 1m, 3m, 5m, 15m (derived from the 1m data) "
+                              "and print a comparison matrix of P&L, profit, loss, trades, "
+                              "win rate, and EV, to find the most profitable timeframe.")
     args = parser.parse_args()
 
     print("\n*** IMPORTANT: position sizing = 100% of current equity per trade ***")
@@ -502,6 +611,32 @@ def main():
     print("*** carefully before considering this for real capital. ***\n")
 
     df = load_data(refresh=args.refresh)
+
+    if args.multi_tf:
+        timeframes = {
+            "1m": "1min",
+            "3m": "3min",
+            "5m": "5min",
+            "15m": "15min",
+        }
+        matrix_df, details = run_multi_timeframe(df, timeframes, execution_mode=args.execution)
+        print_matrix(matrix_df)
+
+        out_matrix = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timeframe_comparison.csv")
+        matrix_df.to_csv(out_matrix)
+        print(f"\nComparison matrix saved to: {out_matrix}")
+
+        for label, (trades_df, equity_df, metrics) in details.items():
+            if trades_df.empty:
+                continue
+            safe_label = label.replace(" ", "_")
+            t_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"trades_log_{safe_label}.csv")
+            e_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"equity_curve_{safe_label}.csv")
+            trades_df.to_csv(t_path, index=False)
+            equity_df.to_csv(e_path, index=False)
+        print("Per-timeframe trade logs and equity curves saved alongside this script.")
+        return
+
     df = add_indicators(df)
 
     trades_df, equity_df = run_backtest(df, execution_mode=args.execution)
