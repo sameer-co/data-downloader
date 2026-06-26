@@ -1,660 +1,487 @@
 #!/usr/bin/env python3
 """
-SOLUSDC 1-Minute RSI(28)/EMA(13) Crossover Backtest
-=====================================================
+SOL 9EMA / 9SMA Crossover — 2-Year Backtest
+=============================================
 
-Strategy
---------
-- Indicator: RSI(28) and a 13-period EMA of that RSI line.
-- Entry (LONG ONLY): when RSI(28) crosses ABOVE its 13 EMA -> BUY at the
-  close of the signal candle (next-bar-open execution is also supported,
-  see EXECUTION_MODE below).
-- Stop Loss: low of the candle immediately BEFORE the signal/trigger candle.
-- Take Profit: entry + 2.2 * (entry - stop_loss)   [Risk:Reward = 1 : 2.2]
-- Costs: 0.06% total round-trip cost (entry + exit combined), applied as a
-  simple percentage drag on the trade's gross return.
-- Position sizing: FULL ACCOUNT, COMPOUNDING (spot-style, no leverage,
-  no shorting, one position open at a time). Every trade risks 100% of
-  current equity (you chose this explicitly to see compounding behavior --
-  see the warning printed at runtime).
-- Account starts at $100.
+Strategy under test (BUY only):
+    Entry  -> 9 EMA crosses ABOVE 9 SMA (on a CLOSED candle)
+              Enter at the close of the crossing candle.
+    SL     -> low of the crossing ("trigger") candle
+    Target -> entry + 2 * (entry - SL)      (1:2 risk:reward)
+    Exit   -> whichever of SL / Target is hit first, checked candle by
+              candle going forward. Opposite (bearish) crossovers are
+              IGNORED as an exit reason, per spec -- a trade only closes
+              on SL or Target.
+    Sizing -> account starts at $1000. Each trade goes ALL-IN:
+                  quantity = balance / entry_price
+              0.06% round-trip fee is charged on notional value
+              (applied at entry and modeled in the exit pnl).
+    Only one position open at a time. While in a trade, new BUY signals
+    are ignored (we don't pyramid).
 
-Data
-----
-Binance public REST API, no API key required:
-  GET https://api.binance.com/api/v3/klines
-Symbol: SOLUSDC, Interval: 1m, Range: last 365 days (auto, paginated).
-Data is cached to a local CSV (solusdc_1m_1y.csv) so re-runs don't
-re-download ~525,600 candles every time.
+Runs independently on 3m, 5m and 15m and prints/exports a metrics
+report for each, plus an equity curve CSV.
 
-Dependencies
-------------
-This script installs any missing dependencies itself on first run
-(pandas, numpy, requests). No manual `pip install` needed.
+------------------------------------------------------------------
+DATA: This script pulls 2 years of historical klines directly from
+Binance's public REST API (no key needed). It paginates in chunks of
+1000 candles using startTime/endTime, respecting Binance's public rate
+limits with a small delay between calls.
 
-Usage
------
-    python3 solusdc_rsi_ema_backtest.py
-    python3 solusdc_rsi_ema_backtest.py --multi-tf
-
-Optional flags:
-    --refresh           Force re-download of data (ignore cache)
-    --execution close   Enter at signal-candle CLOSE (default)
-    --execution next    Enter at NEXT candle OPEN (more realistic, avoids lookahead)
-    --multi-tf           Run on 1m/3m/5m/15m (derived from the same 1m data)
-                          and print a comparison matrix (P&L, profit, loss,
-                          trade count, win rate, EV) to find the most
-                          profitable timeframe.
+Run it somewhere with normal internet access to api.binance.com
+(your machine, a VPS, Railway, etc).
+------------------------------------------------------------------
 """
 
 import sys
 import subprocess
 import importlib
-import argparse
-import os
-import time
-from datetime import datetime, timedelta, timezone
+
 
 # ---------------------------------------------------------------------------
-# 0. SELF-INSTALLING DEPENDENCIES
+# 0. AUTO-INSTALL DEPENDENCIES
 # ---------------------------------------------------------------------------
-REQUIRED = {
-    "pandas": "pandas",
-    "numpy": "numpy",
-    "requests": "requests",
-}
+REQUIRED_PACKAGES = ["requests", "pandas", "numpy"]
+
 
 def ensure_dependencies():
-    missing = []
-    for import_name, pip_name in REQUIRED.items():
+    for pkg in REQUIRED_PACKAGES:
         try:
-            importlib.import_module(import_name)
+            importlib.import_module(pkg)
         except ImportError:
-            missing.append(pip_name)
-    if missing:
-        print(f"[setup] Installing missing dependencies: {', '.join(missing)} ...")
-        cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + missing
-        # --break-system-packages is needed on some externally-managed Python
-        # installs (PEP 668, e.g. recent Debian/Ubuntu). Try normal install
-        # first, fall back if it fails.
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            cmd_alt = cmd + ["--break-system-packages"]
-            result2 = subprocess.run(cmd_alt, capture_output=True, text=True)
-            if result2.returncode != 0:
-                print("[setup] ERROR installing dependencies:")
-                print(result.stderr)
-                print(result2.stderr)
-                sys.exit(1)
-        print("[setup] Dependencies installed.")
+            print(f"[setup] '{pkg}' not found, installing...")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", pkg]
+            )
+            print(f"[setup] '{pkg}' installed.")
+
 
 ensure_dependencies()
 
-import numpy as np
-import pandas as pd
+import time
+import math
+from datetime import datetime, timezone, timedelta
+
 import requests
+import pandas as pd
+import numpy as np
+
 
 # ---------------------------------------------------------------------------
 # 1. CONFIG
 # ---------------------------------------------------------------------------
-SYMBOL = "SOLUSDC"
-INTERVAL = "1m"
-DAYS_BACK = 365
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solusdc_1m_1y.csv")
+SYMBOL = "SOLUSDT"
+TIMEFRAMES = ["3m", "5m", "15m"]
 
-RSI_LEN = 28
-EMA_LEN = 13
-RR_MULTIPLE = 2.2          # target = entry + RR_MULTIPLE * risk
-ROUND_TRIP_COST_PCT = 0.06 / 100.0   # 0.06% total (entry+exit combined)
-STARTING_EQUITY = 100.0
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-MAX_LIMIT = 1000  # Binance max candles per request
+EMA_FAST_PERIOD = 9
+SMA_PERIOD = 9
+EMA_TREND_PERIOD = 13   # informational only, not used as a filter here
+RSI_PERIOD = 28         # informational only, not used as a filter here
+
+LOOKBACK_DAYS = 730       # ~2 years
+STARTING_BALANCE = 1000.0
+ROUNDTRIP_FEE_PCT = 0.0006   # 0.06% round trip (entry+exit combined)
+RISK_REWARD = 2.0            # target = entry + RR * (entry - sl)
+
+BINANCE_BASE_URL = "https://api.binance.com"
+KLINES_ENDPOINT = "/api/v3/klines"
+MAX_LIMIT = 1000
+
+OUTPUT_DIR = "."  # change if you want CSVs elsewhere
 
 
 # ---------------------------------------------------------------------------
-# 2. DATA DOWNLOAD (Binance public API, paginated, cached)
+# 2. DATA FETCH (paginated, 2 years)
 # ---------------------------------------------------------------------------
-def download_binance_klines(symbol=SYMBOL, interval=INTERVAL, days_back=DAYS_BACK):
-    """
-    Downloads `days_back` days of historical klines from Binance's public
-    REST API (no API key needed) and returns a clean OHLCV DataFrame.
-    Paginates in chunks of MAX_LIMIT candles, respecting rate limits.
-    """
+def fetch_full_history(symbol, interval, lookback_days):
+    """Paginate Binance klines backwards from now to `lookback_days` ago.
+    Returns a pandas DataFrame, oldest -> newest, with closed candles only
+    (the very last in-progress candle, if any, is dropped)."""
+
     end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_time = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp() * 1000)
+    start_time = int(
+        (datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp() * 1000
+    )
 
     all_rows = []
-    cur_start = start_time
+    cursor = start_time
     session = requests.Session()
-    request_count = 0
 
-    print(f"[data] Downloading {days_back}d of {interval} {symbol} klines from Binance...")
+    print(f"[data] Fetching {symbol} {interval} from {datetime.fromtimestamp(start_time/1000, tz=timezone.utc).date()} "
+          f"to {datetime.fromtimestamp(end_time/1000, tz=timezone.utc).date()} ...")
 
-    while cur_start < end_time:
+    while cursor < end_time:
         params = {
             "symbol": symbol,
             "interval": interval,
-            "startTime": cur_start,
+            "startTime": cursor,
             "limit": MAX_LIMIT,
         }
-        for attempt in range(5):
-            try:
-                resp = session.get(BINANCE_KLINES_URL, params=params, timeout=15)
-                if resp.status_code == 200:
-                    break
-                elif resp.status_code == 429:
-                    wait = 5 * (attempt + 1)
-                    print(f"[data] Rate limited, waiting {wait}s...")
-                    time.sleep(wait)
-                else:
-                    print(f"[data] HTTP {resp.status_code}: {resp.text[:200]}")
-                    time.sleep(2)
-            except requests.exceptions.RequestException as e:
-                print(f"[data] Request error: {e}, retrying...")
-                time.sleep(3)
-        else:
-            raise RuntimeError("Failed to fetch klines after multiple retries.")
-
+        resp = session.get(BINANCE_BASE_URL + KLINES_ENDPOINT, params=params, timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Binance API error {resp.status_code}: {resp.text[:300]}")
         batch = resp.json()
         if not batch:
             break
 
         all_rows.extend(batch)
         last_open_time = batch[-1][0]
-        cur_start = last_open_time + 1  # next page starts right after last candle
-        request_count += 1
 
-        if request_count % 20 == 0:
-            pct = min(100.0, (cur_start - start_time) / (end_time - start_time) * 100)
-            print(f"[data] ...{len(all_rows):,} candles fetched ({pct:.1f}%)")
-
-        # Be polite to the API (well under the 1200 req/min weight limit)
-        time.sleep(0.05)
+        # Advance cursor past the last candle we got. Binance kline open
+        # times are evenly spaced, so +1ms is enough to not refetch the
+        # same candle, but we also break if we've reached "now".
+        cursor = last_open_time + 1
 
         if len(batch) < MAX_LIMIT:
-            # short batch usually means we've caught up to "now"
-            if cur_start >= end_time:
-                break
+            break
 
-    print(f"[data] Download complete: {len(all_rows):,} candles.")
+        time.sleep(0.25)  # be polite to the public rate limit
 
-    cols = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ]
-    df = pd.DataFrame(all_rows, columns=cols)
+    if not all_rows:
+        raise RuntimeError(f"No data returned for {symbol} {interval}")
+
+    df = pd.DataFrame(
+        all_rows,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore",
+        ],
+    )
+    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time"]].copy()
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = df[c].astype(float)
 
-    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
-    df = df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
+    # Drop duplicate candles that can occur at pagination boundaries
+    df = df.drop_duplicates(subset="open_time").reset_index(drop=True)
+
+    # Drop the last candle if it's still forming (close_time in the future)
+    now_utc = datetime.now(timezone.utc)
+    if df.iloc[-1]["close_time"].to_pydatetime() > now_utc:
+        df = df.iloc[:-1].reset_index(drop=True)
+
+    print(f"[data] Got {len(df)} closed candles for {interval}.")
     return df
 
 
-def load_data(refresh=False):
-    if (not refresh) and os.path.exists(CACHE_FILE):
-        print(f"[data] Loading cached data from {CACHE_FILE}")
-        df = pd.read_csv(CACHE_FILE, parse_dates=["open_time", "close_time"])
-        age_days = (datetime.now(timezone.utc) - df["open_time"].max().tz_convert("UTC")).total_seconds() / 86400
-        print(f"[data] Cached data spans {df['open_time'].min()} -> {df['open_time'].max()} "
-              f"({len(df):,} rows, newest candle is {age_days:.1f} days old)")
-        return df
-
-    df = download_binance_klines()
-    df.to_csv(CACHE_FILE, index=False)
-    print(f"[data] Saved cache to {CACHE_FILE}")
-    return df
-
-
-def resample_ohlc(df_1m: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    Derives a higher timeframe (e.g. '3min', '5min', '15min') from 1-minute
-    OHLCV data. Using the same underlying 1m data for every timeframe keeps
-    the comparison fair (identical price history, just different candle
-    aggregation), instead of pulling each timeframe separately from Binance.
-    """
-    d = df_1m.set_index("open_time").sort_index()
-    out = d.resample(rule, label="left", closed="left").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }).dropna(subset=["open", "high", "low", "close"])
-    out = out.reset_index()
-    out["close_time"] = out["open_time"] + pd.to_timedelta(rule) - pd.Timedelta(milliseconds=1)
-    return out
-
-
 # ---------------------------------------------------------------------------
-# 3. INDICATORS
+# 3. INDICATORS (vectorized with pandas, same conventions as the live bot:
+#    SMA-seeded EMA, Wilder's RSI)
 # ---------------------------------------------------------------------------
-def compute_rsi(close: pd.Series, length: int = 14) -> pd.Series:
-    """Classic Wilder RSI."""
-    delta = close.diff()
+def add_indicators(df):
+    df = df.copy()
+
+    closes = df["close"]
+
+    # SMA-seeded EMA, matching the live bot's behaviour exactly.
+    def sma_seeded_ema(series, period):
+        values = series.to_numpy()
+        out = np.full(len(values), np.nan)
+        if len(values) < period:
+            return pd.Series(out, index=series.index)
+        k = 2 / (period + 1)
+        seed = values[:period].mean()
+        out[period - 1] = seed
+        prev = seed
+        for i in range(period, len(values)):
+            prev = values[i] * k + prev * (1 - k)
+            out[i] = prev
+        return pd.Series(out, index=series.index)
+
+    df["ema9"] = sma_seeded_ema(closes, EMA_FAST_PERIOD)
+    df["sma9"] = closes.rolling(SMA_PERIOD).mean()
+    df["ema13"] = sma_seeded_ema(closes, EMA_TREND_PERIOD)
+
+    # Wilder's RSI(28)
+    delta = closes.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-
+    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.where(avg_loss != 0, 100.0)          # no losses -> RSI 100
-    rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)  # flat -> 50
-    return rsi
+    df["rsi28"] = 100 - (100 / (1 + rs))
+    df.loc[avg_loss == 0, "rsi28"] = 100.0
 
+    # Crossover relationship + detect actual cross events
+    df["relationship"] = np.where(df["ema9"] > df["sma9"], "above", "below")
+    df["prev_relationship"] = df["relationship"].shift(1)
+    df["bullish_cross"] = (df["prev_relationship"] == "below") & (df["relationship"] == "above")
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["rsi"] = compute_rsi(df["close"], RSI_LEN)
-    df["rsi_ema"] = df["rsi"].ewm(span=EMA_LEN, adjust=False).mean()
     return df
 
 
 # ---------------------------------------------------------------------------
 # 4. BACKTEST ENGINE
 # ---------------------------------------------------------------------------
-def run_backtest(df: pd.DataFrame, execution_mode: str = "close"):
+def run_backtest(df, interval):
     """
-    execution_mode:
-      'close' -> enter at the close of the signal candle (the candle where
-                 the crossover is confirmed). Simpler, but technically
-                 assumes you can transact exactly at the closing price.
-      'next'  -> enter at the OPEN of the candle AFTER the signal candle.
-                 More realistic (no lookahead), since the signal candle's
-                 close isn't known until it closes.
+    Walk forward candle by candle. On a bullish cross (closed candle),
+    if not already in a position, open a BUY trade:
+        entry = close of trigger candle
+        sl    = low of trigger candle
+        target = entry + RISK_REWARD * (entry - sl)
+    Then scan forward from the NEXT candle to find whichever of
+    sl/target is touched first (using candle high/low, not just close,
+    for realism). If a candle's range touches both sl and target in the
+    same candle, we conservatively assume SL was hit first (worst case).
 
-    Rules (long only):
-      - Signal: rsi crosses above rsi_ema on the signal candle (rsi[i-1] <= ema[i-1]
-        and rsi[i] > ema[i]).
-      - Entry price: signal candle close ('close' mode) or next candle open ('next' mode).
-      - Stop loss: low of the candle immediately BEFORE the signal candle (index i-1).
-      - Take profit: entry + 2.2 * (entry - stop_loss).
-      - Only one position open at a time (no pyramiding/overlapping trades).
-      - Exit check uses high/low of subsequent candles; if both TP and SL are
-        touched within the same candle, SL is assumed hit first (conservative).
-      - Round trip cost (0.06%) deducted from gross trade return.
-      - Position size = 100% of current equity (full compounding, spot-style,
-        no leverage).
+    Position sizing: all-in. quantity = balance / entry.
+    Fee: 0.06% round-trip charged on notional (entry_notional + exit_notional) * fee/2 each side,
+         net effect modeled as: pnl_after_fee = pnl_gross - (entry_notional + exit_notional) * (ROUNDTRIP_FEE_PCT/2)... 
+    Simplified equivalent (used below): fee_cost = entry_notional * ROUNDTRIP_FEE_PCT (whole round-trip
+         charged once against entry notional, which is the standard simplification of round-trip cost).
     """
-    n = len(df)
-    rsi = df["rsi"].values
-    ema = df["rsi_ema"].values
-    high = df["high"].values
-    low = df["low"].values
-    close = df["close"].values
-    openp = df["open"].values
-    times = df["open_time"].values
-
     trades = []
-    equity = STARTING_EQUITY
-    equity_curve = [(times[0], equity)]
+    balance = STARTING_BALANCE
+    equity_curve = [{"time": df.iloc[0]["open_time"], "balance": balance}]
 
     in_position = False
-    i = max(RSI_LEN, EMA_LEN) + 2  # warmup
+    entry_idx = None
+    entry_price = sl_price = target_price = None
+    quantity = None
 
-    while i < n - 1:
+    n = len(df)
+    min_valid_idx = max(EMA_TREND_PERIOD, RSI_PERIOD + 1, SMA_PERIOD) + 1
+
+    for i in range(min_valid_idx, n):
+        row = df.iloc[i]
+
         if not in_position:
-            # crossover check: rsi was <= ema, now > ema
-            if (not np.isnan(rsi[i - 1])) and (not np.isnan(ema[i - 1])) and \
-               (not np.isnan(rsi[i])) and (not np.isnan(ema[i])):
-                crossed_up = (rsi[i - 1] <= ema[i - 1]) and (rsi[i] > ema[i])
-            else:
-                crossed_up = False
-
-            if crossed_up:
-                signal_idx = i
-                sl_price = low[signal_idx - 1]  # previous (trigger-1) candle low
-
-                if execution_mode == "close":
-                    entry_idx = signal_idx
-                    entry_price = close[signal_idx]
-                else:  # 'next'
-                    entry_idx = signal_idx + 1
-                    if entry_idx >= n:
-                        break
-                    entry_price = openp[entry_idx]
-
+            if bool(row["bullish_cross"]):
+                entry_price = float(row["close"])
+                sl_price = float(row["low"])
                 risk = entry_price - sl_price
+
                 if risk <= 0:
-                    # invalid setup (SL above/at entry) -> skip this signal
-                    i += 1
+                    # Degenerate case (shouldn't really happen: entry should
+                    # be >= candle low). Skip this signal.
                     continue
 
-                tp_price = entry_price + RR_MULTIPLE * risk
+                target_price = entry_price + RISK_REWARD * risk
+                quantity = balance / entry_price
+                entry_idx = i
+                in_position = True
+        else:
+            # Check if THIS candle's range hits SL or Target.
+            # Conservative assumption: if both are touched in the same
+            # candle, SL is assumed hit first.
+            hit_sl = row["low"] <= sl_price
+            hit_target = row["high"] >= target_price
 
-                # walk forward from the bar after entry to find exit
-                exit_idx = None
-                exit_price = None
-                exit_reason = None
-                j = entry_idx + 1
-                while j < n:
-                    hit_sl = low[j] <= sl_price
-                    hit_tp = high[j] >= tp_price
-                    if hit_sl and hit_tp:
-                        # conservative assumption: SL hit first
-                        exit_idx, exit_price, exit_reason = j, sl_price, "SL"
-                        break
-                    elif hit_sl:
-                        exit_idx, exit_price, exit_reason = j, sl_price, "SL"
-                        break
-                    elif hit_tp:
-                        exit_idx, exit_price, exit_reason = j, tp_price, "TP"
-                        break
-                    j += 1
+            exit_price = None
+            exit_reason = None
 
-                if exit_idx is None:
-                    # ran out of data before resolving -> close at last available price
-                    exit_idx = n - 1
-                    exit_price = close[exit_idx]
-                    exit_reason = "EOD_FORCE_CLOSE"
+            if hit_sl:
+                exit_price = sl_price
+                exit_reason = "SL"
+            elif hit_target:
+                exit_price = target_price
+                exit_reason = "TARGET"
 
-                gross_ret = (exit_price - entry_price) / entry_price
-                net_ret = gross_ret - ROUND_TRIP_COST_PCT  # full round-trip cost on the trade
+            if exit_price is not None:
+                entry_notional = quantity * entry_price
+                exit_notional = quantity * exit_price
+                gross_pnl = exit_notional - entry_notional
+                fee_cost = entry_notional * ROUNDTRIP_FEE_PCT  # round-trip fee on notional
+                net_pnl = gross_pnl - fee_cost
 
-                pnl_dollars = equity * net_ret
-                equity_before = equity
-                equity = equity + pnl_dollars
+                balance += net_pnl
+
+                r_multiple = (exit_price - entry_price) / (entry_price - sl_price)
 
                 trades.append({
-                    "signal_time": times[signal_idx],
-                    "entry_time": times[entry_idx],
-                    "exit_time": times[exit_idx],
+                    "entry_time": df.iloc[entry_idx]["open_time"],
+                    "exit_time": row["open_time"],
                     "entry_price": entry_price,
                     "sl_price": sl_price,
-                    "tp_price": tp_price,
+                    "target_price": target_price,
                     "exit_price": exit_price,
                     "exit_reason": exit_reason,
-                    "risk_pct": risk / entry_price,
-                    "gross_return_pct": gross_ret,
-                    "net_return_pct": net_ret,
-                    "equity_before": equity_before,
-                    "equity_after": equity,
-                    "pnl_dollars": pnl_dollars,
-                    "bars_held": exit_idx - entry_idx,
+                    "quantity": quantity,
+                    "gross_pnl": gross_pnl,
+                    "fee_cost": fee_cost,
+                    "net_pnl": net_pnl,
+                    "r_multiple": r_multiple,
+                    "balance_after": balance,
+                    "bars_held": i - entry_idx,
                 })
-                equity_curve.append((times[exit_idx], equity))
 
-                i = exit_idx + 1  # no overlapping trades
-                continue
-        i += 1
+                equity_curve.append({"time": row["open_time"], "balance": balance})
+
+                in_position = False
+                entry_idx = None
+                entry_price = sl_price = target_price = quantity = None
+
+                if balance <= 0:
+                    print(f"[{interval}] Account blown to <= 0 at {row['open_time']}, stopping backtest.")
+                    break
 
     trades_df = pd.DataFrame(trades)
-    equity_df = pd.DataFrame(equity_curve, columns=["time", "equity"])
-    return trades_df, equity_df
+    equity_df = pd.DataFrame(equity_curve)
+    return trades_df, equity_df, balance
 
 
 # ---------------------------------------------------------------------------
 # 5. METRICS
 # ---------------------------------------------------------------------------
-def max_drawdown(equity_series: pd.Series):
-    running_max = equity_series.cummax()
-    dd = (equity_series - running_max) / running_max
-    return dd.min(), dd.idxmin()
-
-
-def compute_metrics(trades_df: pd.DataFrame, equity_df: pd.DataFrame, starting_equity: float):
+def compute_metrics(trades_df, equity_df, starting_balance, final_balance, interval, df_full):
     if trades_df.empty:
-        print("No trades were generated. Try a longer period or check the data.")
-        return {}
+        return {
+            "timeframe": interval,
+            "total_trades": 0,
+            "note": "No trades were generated in this period.",
+        }
 
-    n_trades = len(trades_df)
-    wins = trades_df[trades_df["net_return_pct"] > 0]
-    losses = trades_df[trades_df["net_return_pct"] <= 0]
+    wins = trades_df[trades_df["net_pnl"] > 0]
+    losses = trades_df[trades_df["net_pnl"] <= 0]
 
-    n_wins = len(wins)
-    n_losses = len(losses)
-    win_rate = n_wins / n_trades * 100
+    total_trades = len(trades_df)
+    win_rate = len(wins) / total_trades * 100
 
-    final_equity = equity_df["equity"].iloc[-1]
-    total_pnl_dollars = final_equity - starting_equity
-    total_return_pct = (final_equity / starting_equity - 1) * 100
+    gross_profit = wins["net_pnl"].sum()
+    gross_loss = -losses["net_pnl"].sum()  # positive number
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
 
-    avg_win_pct = wins["net_return_pct"].mean() * 100 if n_wins > 0 else 0.0
-    avg_loss_pct = losses["net_return_pct"].mean() * 100 if n_losses > 0 else 0.0
-    avg_win_dollars = wins["pnl_dollars"].mean() if n_wins > 0 else 0.0
-    avg_loss_dollars = losses["pnl_dollars"].mean() if n_losses > 0 else 0.0
-
-    gross_profit = wins["pnl_dollars"].sum() if n_wins > 0 else 0.0
-    gross_loss = -losses["pnl_dollars"].sum() if n_losses > 0 else 0.0
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-
-    # Expectancy (EV) per trade, in % return terms and in $ terms
-    ev_pct = (win_rate / 100 * avg_win_pct) + ((1 - win_rate / 100) * avg_loss_pct)
-    ev_dollars = trades_df["pnl_dollars"].mean()
-
-    # average R multiple actually achieved (using each trade's own risk)
-    trades_df = trades_df.copy()
-    trades_df["r_multiple"] = trades_df["net_return_pct"] / trades_df["risk_pct"].replace(0, np.nan)
     avg_r = trades_df["r_multiple"].mean()
-    expectancy_r = (win_rate / 100) * RR_MULTIPLE - (1 - win_rate / 100) * 1  # theoretical R-based EV
+    avg_win_r = wins["r_multiple"].mean() if not wins.empty else 0
+    avg_loss_r = losses["r_multiple"].mean() if not losses.empty else 0
 
-    largest_win = trades_df["pnl_dollars"].max()
-    largest_loss = trades_df["pnl_dollars"].min()
+    total_return_pct = (final_balance / starting_balance - 1) * 100
 
-    max_dd_pct, max_dd_time_idx = max_drawdown(equity_df["equity"])
-    max_dd_time = equity_df.loc[max_dd_time_idx, "time"] if not equity_df.empty else None
+    # Max drawdown on the equity curve
+    eq = equity_df["balance"].to_numpy()
+    running_max = np.maximum.accumulate(eq)
+    drawdowns = (eq - running_max) / running_max
+    max_dd_pct = drawdowns.min() * 100 if len(drawdowns) else 0.0
 
     # Consecutive wins/losses
-    streak = (trades_df["net_return_pct"] > 0).astype(int)
-    max_consec_win = max_consec_loss = cur_win = cur_loss = 0
-    for v in streak:
-        if v == 1:
-            cur_win += 1; cur_loss = 0
-            max_consec_win = max(max_consec_win, cur_win)
+    streak = 0
+    max_win_streak = 0
+    max_loss_streak = 0
+    cur_streak_type = None
+    for pnl in trades_df["net_pnl"]:
+        is_win = pnl > 0
+        if cur_streak_type == is_win:
+            streak += 1
         else:
-            cur_loss += 1; cur_win = 0
-            max_consec_loss = max(max_consec_loss, cur_loss)
+            streak = 1
+            cur_streak_type = is_win
+        if is_win:
+            max_win_streak = max(max_win_streak, streak)
+        else:
+            max_loss_streak = max(max_loss_streak, streak)
 
     avg_bars_held = trades_df["bars_held"].mean()
 
-    # Sharpe-like ratio on per-trade returns (not annualized to a clean period
-    # since trade frequency is irregular; shown as per-trade Sharpe)
-    ret_std = trades_df["net_return_pct"].std()
-    sharpe_per_trade = trades_df["net_return_pct"].mean() / ret_std if ret_std > 0 else np.nan
+    total_fees = trades_df["fee_cost"].sum()
 
-    # CAGR based on actual elapsed time of the data
-    start_time = equity_df["time"].iloc[0]
-    end_time = equity_df["time"].iloc[-1]
-    elapsed_days = (pd.to_datetime(end_time) - pd.to_datetime(start_time)).total_seconds() / 86400
-    elapsed_years = elapsed_days / 365.25 if elapsed_days > 0 else np.nan
-    cagr = ((final_equity / starting_equity) ** (1 / elapsed_years) - 1) * 100 if elapsed_years and elapsed_years > 0 else np.nan
+    period_days = (df_full.iloc[-1]["open_time"] - df_full.iloc[0]["open_time"]).total_seconds() / 86400
+    trades_per_day = total_trades / period_days if period_days > 0 else 0
 
-    metrics = {
-        "Total trades": n_trades,
-        "Winning trades": n_wins,
-        "Losing trades": n_losses,
-        "Win rate (%)": win_rate,
-        "Starting equity ($)": starting_equity,
-        "Final equity ($)": final_equity,
-        "Total P&L ($)": total_pnl_dollars,
-        "Total return (%)": total_return_pct,
-        "CAGR (%) [approx, compounding]": cagr,
-        "Avg win (%)": avg_win_pct,
-        "Avg loss (%)": avg_loss_pct,
-        "Avg win ($, at time of trade)": avg_win_dollars,
-        "Avg loss ($, at time of trade)": avg_loss_dollars,
-        "Largest win ($)": largest_win,
-        "Largest loss ($)": largest_loss,
-        "Gross profit ($, sum of winning trades)": gross_profit,
-        "Gross loss ($, sum of losing trades)": gross_loss,
-        "Profit factor": profit_factor,
-        "Expectancy / EV per trade (%)": ev_pct,
-        "Expectancy / EV per trade ($, at time of trade)": ev_dollars,
-        "Theoretical R-based expectancy (R per trade)": expectancy_r,
-        "Avg realized R-multiple per trade": avg_r,
-        "Max drawdown (%)": max_dd_pct * 100,
-        "Max drawdown date": max_dd_time,
-        "Max consecutive wins": max_consec_win,
-        "Max consecutive losses": max_consec_loss,
-        "Avg bars held (minutes)": avg_bars_held,
-        "Per-trade Sharpe (mean/std of trade returns)": sharpe_per_trade,
-        "Exit reason breakdown": trades_df["exit_reason"].value_counts().to_dict(),
-    }
-    return metrics
+    # CAGR-ish: annualized return based on actual period length
+    years = period_days / 365.25
+    if years > 0 and final_balance > 0:
+        annualized_return_pct = ((final_balance / starting_balance) ** (1 / years) - 1) * 100
+    else:
+        annualized_return_pct = float("nan")
 
-
-def print_report(metrics: dict):
-    print("\n" + "=" * 70)
-    print(" BACKTEST RESULTS: SOLUSDC 1m | RSI(28)/EMA(13) crossover | Long-only")
-    print("=" * 70)
-    for k, v in metrics.items():
-        if isinstance(v, float):
-            print(f"{k:<55}: {v:,.4f}")
-        else:
-            print(f"{k:<55}: {v}")
-    print("=" * 70)
-
-
-def extract_summary_row(metrics: dict, label: str) -> dict:
-    """Pulls just the headline fields requested for the timeframe comparison
-    matrix: P&L, total profit, total loss, number of trades, win rate, EV."""
-    if not metrics:
-        return {
-            "Timeframe": label, "Trades": 0, "Win Rate (%)": np.nan,
-            "Total P&L ($)": np.nan, "Total Profit ($)": np.nan,
-            "Total Loss ($)": np.nan, "EV per trade (%)": np.nan,
-            "EV per trade ($)": np.nan, "Final Equity ($)": np.nan,
-            "Profit Factor": np.nan, "Max Drawdown (%)": np.nan,
-        }
     return {
-        "Timeframe": label,
-        "Trades": metrics["Total trades"],
-        "Win Rate (%)": metrics["Win rate (%)"],
-        "Total P&L ($)": metrics["Total P&L ($)"],
-        "Total Profit ($)": metrics["Gross profit ($, sum of winning trades)"],
-        "Total Loss ($)": metrics["Gross loss ($, sum of losing trades)"],
-        "EV per trade (%)": metrics["Expectancy / EV per trade (%)"],
-        "EV per trade ($)": metrics["Expectancy / EV per trade ($, at time of trade)"],
-        "Final Equity ($)": metrics["Final equity ($)"],
-        "Profit Factor": metrics["Profit factor"],
-        "Max Drawdown (%)": metrics["Max drawdown (%)"],
+        "timeframe": interval,
+        "period_start": df_full.iloc[0]["open_time"],
+        "period_end": df_full.iloc[-1]["open_time"],
+        "period_days": round(period_days, 1),
+        "total_trades": total_trades,
+        "trades_per_day": round(trades_per_day, 2),
+        "win_rate_pct": round(win_rate, 2),
+        "wins": len(wins),
+        "losses": len(losses),
+        "avg_r_multiple": round(avg_r, 3),
+        "avg_win_r_multiple": round(avg_win_r, 3),
+        "avg_loss_r_multiple": round(avg_loss_r, 3),
+        "profit_factor": round(profit_factor, 3) if math.isfinite(profit_factor) else "inf",
+        "starting_balance": starting_balance,
+        "final_balance": round(final_balance, 2),
+        "total_return_pct": round(total_return_pct, 2),
+        "annualized_return_pct": round(annualized_return_pct, 2) if not math.isnan(annualized_return_pct) else "N/A",
+        "max_drawdown_pct": round(max_dd_pct, 2),
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
+        "avg_bars_held": round(avg_bars_held, 1),
+        "total_fees_paid": round(total_fees, 2),
     }
 
 
-def run_multi_timeframe(df_1m: pd.DataFrame, timeframes: dict, execution_mode: str = "close"):
-    """
-    Runs the full strategy independently on each timeframe (each one gets
-    its own RSI/EMA computed on its own candles, its own crossovers, its
-    own trades) and returns a comparison DataFrame plus a dict of
-    {label: (trades_df, equity_df, metrics)} for deeper inspection.
-    """
-    rows = []
-    details = {}
+def print_metrics_report(metrics):
+    tf = metrics["timeframe"]
+    print("\n" + "=" * 60)
+    print(f" RESULTS — {SYMBOL} [{tf}]  9EMA/9SMA Crossover BUY Strategy")
+    print("=" * 60)
 
-    for label, rule in timeframes.items():
-        print(f"\n[multi-tf] Processing {label} ({rule}) ...")
-        if rule == "1min":
-            tf_df = df_1m.copy()
-        else:
-            tf_df = resample_ohlc(df_1m, rule)
+    if metrics.get("total_trades", 0) == 0:
+        print(metrics.get("note", "No trades."))
+        return
 
-        tf_df = add_indicators(tf_df)
-        trades_df, equity_df = run_backtest(tf_df, execution_mode=execution_mode)
-        metrics = compute_metrics(trades_df, equity_df, STARTING_EQUITY) if not trades_df.empty else {}
-
-        rows.append(extract_summary_row(metrics, label))
-        details[label] = (trades_df, equity_df, metrics)
-        print(f"[multi-tf] {label}: {len(trades_df)} trades, "
-              f"win rate {metrics.get('Win rate (%)', float('nan')):.2f}%, "
-              f"P&L ${metrics.get('Total P&L ($)', float('nan')):.2f}" if metrics else
-              f"[multi-tf] {label}: no trades generated")
-
-    matrix_df = pd.DataFrame(rows).set_index("Timeframe")
-    return matrix_df, details
-
-
-def print_matrix(matrix_df: pd.DataFrame):
-    print("\n" + "=" * 100)
-    print(" MULTI-TIMEFRAME COMPARISON: SOLUSDC | RSI(28)/EMA(13) crossover | Long-only")
-    print(" (Most profitable timeframe = highest Total P&L / highest EV, watch Max Drawdown too)")
-    print("=" * 100)
-    with pd.option_context("display.float_format", "{:,.4f}".format,
-                            "display.max_columns", None,
-                            "display.width", 140):
-        print(matrix_df)
-    print("=" * 100)
-
-    if matrix_df["Total P&L ($)"].notna().any():
-        best_pnl = matrix_df["Total P&L ($)"].idxmax()
-        best_ev = matrix_df["EV per trade (%)"].idxmax()
-        print(f"\nHighest Total P&L:        {best_pnl}  (${matrix_df.loc[best_pnl, 'Total P&L ($)']:.2f})")
-        print(f"Highest EV per trade (%): {best_ev}  ({matrix_df.loc[best_ev, 'EV per trade (%)']:.4f}%)")
-        if best_pnl != best_ev:
-            print("Note: highest total P&L and highest per-trade EV point to different "
-                  "timeframes here -- total P&L also depends on how many trades fired, "
-                  "so a lower-EV timeframe can still win on P&L if it traded much more often.")
+    print(f" Period             : {metrics['period_start'].date()} -> {metrics['period_end'].date()} "
+          f"({metrics['period_days']} days)")
+    print(f" Total trades       : {metrics['total_trades']}  ({metrics['trades_per_day']}/day)")
+    print(f" Win rate           : {metrics['win_rate_pct']}%  ({metrics['wins']}W / {metrics['losses']}L)")
+    print(f" Avg R multiple     : {metrics['avg_r_multiple']}  (avg win {metrics['avg_win_r_multiple']}R, "
+          f"avg loss {metrics['avg_loss_r_multiple']}R)")
+    print(f" Profit factor      : {metrics['profit_factor']}")
+    print(f" Starting balance   : ${metrics['starting_balance']:.2f}")
+    print(f" Final balance      : ${metrics['final_balance']:.2f}")
+    print(f" Total return       : {metrics['total_return_pct']}%")
+    print(f" Annualized return  : {metrics['annualized_return_pct']}%")
+    print(f" Max drawdown       : {metrics['max_drawdown_pct']}%")
+    print(f" Max win streak     : {metrics['max_win_streak']}")
+    print(f" Max loss streak    : {metrics['max_loss_streak']}")
+    print(f" Avg bars held      : {metrics['avg_bars_held']}")
+    print(f" Total fees paid    : ${metrics['total_fees_paid']:.2f}")
+    print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
 # 6. MAIN
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="SOLUSDC RSI/EMA crossover backtest")
-    parser.add_argument("--refresh", action="store_true", help="Force re-download data, ignore cache")
-    parser.add_argument("--execution", choices=["close", "next"], default="close",
-                         help="Entry execution mode: 'close' of signal candle or 'next' candle open")
-    parser.add_argument("--multi-tf", action="store_true",
-                         help="Run the strategy on 1m, 3m, 5m, 15m (derived from the 1m data) "
-                              "and print a comparison matrix of P&L, profit, loss, trades, "
-                              "win rate, and EV, to find the most profitable timeframe.")
-    args = parser.parse_args()
+    all_metrics = []
 
-    print("\n*** IMPORTANT: position sizing = 100% of current equity per trade ***")
-    print("*** (full compounding, no leverage, spot-style, one trade at a time) ***")
-    print("*** This is what you asked for, but note it means a single bad trade")
-    print("*** can wipe out a large fraction of the account. Review results")
-    print("*** carefully before considering this for real capital. ***\n")
+    for interval in TIMEFRAMES:
+        try:
+            raw_df = fetch_full_history(SYMBOL, interval, LOOKBACK_DAYS)
+        except Exception as e:
+            print(f"[{interval}] ERROR fetching data: {e}")
+            continue
 
-    df = load_data(refresh=args.refresh)
+        df = add_indicators(raw_df)
+        trades_df, equity_df, final_balance = run_backtest(df, interval)
+        metrics = compute_metrics(trades_df, equity_df, STARTING_BALANCE, final_balance, interval, df)
+        all_metrics.append(metrics)
+        print_metrics_report(metrics)
 
-    if args.multi_tf:
-        timeframes = {
-            "1m": "1min",
-            "3m": "3min",
-            "5m": "5min",
-            "15m": "15min",
-        }
-        matrix_df, details = run_multi_timeframe(df, timeframes, execution_mode=args.execution)
-        print_matrix(matrix_df)
+        # Export per-timeframe CSVs
+        if not trades_df.empty:
+            trades_path = f"{OUTPUT_DIR}/{SYMBOL}_{interval}_trades.csv"
+            equity_path = f"{OUTPUT_DIR}/{SYMBOL}_{interval}_equity_curve.csv"
+            trades_df.to_csv(trades_path, index=False)
+            equity_df.to_csv(equity_path, index=False)
+            print(f"[{interval}] Trades log  -> {trades_path}")
+            print(f"[{interval}] Equity curve -> {equity_path}")
 
-        out_matrix = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timeframe_comparison.csv")
-        matrix_df.to_csv(out_matrix)
-        print(f"\nComparison matrix saved to: {out_matrix}")
-
-        for label, (trades_df, equity_df, metrics) in details.items():
-            if trades_df.empty:
-                continue
-            safe_label = label.replace(" ", "_")
-            t_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"trades_log_{safe_label}.csv")
-            e_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"equity_curve_{safe_label}.csv")
-            trades_df.to_csv(t_path, index=False)
-            equity_df.to_csv(e_path, index=False)
-        print("Per-timeframe trade logs and equity curves saved alongside this script.")
-        return
-
-    df = add_indicators(df)
-
-    trades_df, equity_df = run_backtest(df, execution_mode=args.execution)
-
-    if trades_df.empty:
-        print("No trades generated.")
-        return
-
-    metrics = compute_metrics(trades_df, equity_df, STARTING_EQUITY)
-    print_report(metrics)
-
-    out_trades = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades_log.csv")
-    trades_df.to_csv(out_trades, index=False)
-    print(f"\nFull trade log saved to: {out_trades}")
-
-    out_equity = os.path.join(os.path.dirname(os.path.abspath(__file__)), "equity_curve.csv")
-    equity_df.to_csv(out_equity, index=False)
-    print(f"Equity curve saved to: {out_equity}")
+    # Combined summary table across timeframes
+    print("\n" + "#" * 60)
+    print(" SUMMARY ACROSS TIMEFRAMES")
+    print("#" * 60)
+    summary_df = pd.DataFrame(all_metrics)
+    if not summary_df.empty:
+        cols = ["timeframe", "total_trades", "win_rate_pct", "profit_factor",
+                "total_return_pct", "annualized_return_pct", "max_drawdown_pct"]
+        cols = [c for c in cols if c in summary_df.columns]
+        print(summary_df[cols].to_string(index=False))
+        summary_df.to_csv(f"{OUTPUT_DIR}/{SYMBOL}_backtest_summary.csv", index=False)
+        print(f"\nSummary saved -> {OUTPUT_DIR}/{SYMBOL}_backtest_summary.csv")
 
 
 if __name__ == "__main__":
